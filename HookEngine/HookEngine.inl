@@ -34,11 +34,23 @@ THE POSSIBILITY OF SUCH DAMAGE.
 namespace nettitude
 {
     const DWORD MAX_THREADS         = 255;                  //arbitrary max thread count...
-    const DWORD INVALID_DISASSEMBLY = 0xFFFFFFFF;
     const BYTE  NOP_INSTRUCTION     = 0x90;                 //nop
     const BYTE  JMP_INSTRUCTION     = 0xE9;                 //jmp
     const BYTE  INT3_INSTRUCTION    = 0xCC;
     const UINT32 STUB_PADDING_BYTES = 8;                    //size of area filled with int3
+
+    const UINT32 MAX_INSTRUCTIONS           = 6;
+    const UINT32 MAX_INSTRUCTION_LEN        = 15;
+    const UINT32 MAX_INSTRUCTION_BUFFER     = MAX_INSTRUCTION_LEN * MAX_INSTRUCTIONS;
+
+    struct DISASSEMBLY_DATA
+    {
+        DWORD     Count;
+        DWORD     Length;
+        DWORD     InstructionLengths[MAX_INSTRUCTIONS];
+        struct ud Instructions[MAX_INSTRUCTIONS];
+        BYTE      InstuctionBuffer[MAX_INSTRUCTION_BUFFER];
+    };
 
     //make sure that these structures are not padded.
 #pragma pack(push,1)

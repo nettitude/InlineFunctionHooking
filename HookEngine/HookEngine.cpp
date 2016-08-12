@@ -114,7 +114,6 @@ namespace nettitude
         CONST SIZE_T                Page = 4096;
         BOOL                        result = FALSE;
 
-        //adjust the protection to be RWE
         if (g_pVirtualProtect(pTargetFunctionAddress, Page, PAGE_EXECUTE_READWRITE, &oldProtection))
         {
             result = TRUE;
@@ -143,13 +142,40 @@ namespace nettitude
         return result;
     }
 
+
     /**
-        HookEngine_GetFuncionByteCount
+    HookEngine_Memcpy
+
+    memcpy without calling memcpy
+    */
+    __forceinline void HookEngine_Memcpy(LPVOID dst, LPCVOID src, SIZE_T length)
+    {
+        if (dst && src && length)
+        {
+            __movsb((unsigned char*)dst, (const unsigned char*)src, length);
+        }
+    }
+
+    /**
+    HookEngine_Memset
+
+    memset without calling memset
+    */
+    __forceinline void HookEngine_Memset(LPVOID dst, BYTE set, SIZE_T length)
+    {
+        if (dst && length)
+        {
+            __stosb((unsigned char*)dst, set, length);
+        }
+    }
+
+    /**
+        HookEngine_Disassemble
 
         Obtain the minimum number of instruction bytes that need to be copied
         from the target function, in order to accomodate our jump instruction
     */
-    static DWORD HookEngine_GetFuncionByteCount(DWORD cbRequired, LPVOID pTargetFunctionAddress)
+    static DWORD HookEngine_Disassemble(DWORD cbRequired, LPVOID pTargetFunctionAddress, DISASSEMBLY_DATA& DisassemblyData )
     {
         CONST SIZE_T Page = 4096;
 
@@ -166,8 +192,14 @@ namespace nettitude
         ud_set_vendor(&ud_obj, UD_VENDOR_INTEL);
         ud_set_input_buffer(&ud_obj, (unsigned char*)pTargetFunctionAddress, Page);
 
-        DWORD result = 0;
         DWORD instrlen = 0;
+
+        DisassemblyData.Count = 0;
+        DisassemblyData.Length = 0;
+
+        HookEngine_Memset(DisassemblyData.Instructions, 0, sizeof(DisassemblyData.Instructions));
+        HookEngine_Memset(DisassemblyData.InstuctionBuffer, 0, sizeof(DisassemblyData.InstuctionBuffer));
+        HookEngine_Memset(DisassemblyData.InstructionLengths, 0, sizeof(DisassemblyData.InstructionLengths));
 
         do
         {
@@ -175,67 +207,69 @@ namespace nettitude
           
             if (instrlen)
             {
-                //
-                // Filter out any instructions that we simply 
-                // cannot patch over with this version of the hooking
-                // engine
-                //
-                switch (ud_obj.mnemonic)
+                if ((DisassemblyData.Length + instrlen) < MAX_INSTRUCTION_BUFFER)
                 {
-                case UD_Ija:
-                case UD_Ijae:
-                case UD_Ijb:
-                case UD_Ijbe:
-                case UD_Ijcxz:
-                case UD_Ijecxz:
-                case UD_Ijg:
-                case UD_Ijge:
-                case UD_Ijl:
-                case UD_Ijle:
-                case UD_Ijmp:
-                case UD_Ijno:
-                case UD_Ijnp:
-                case UD_Ijns:
-                case UD_Ijnz:
-                case UD_Ijo:
-                case UD_Ijp:
-                case UD_Ijrcxz:
-                case UD_Ijs:
-                case UD_Ijz:
-                {
-                    //jump instruction cannot be patched
-                    return INVALID_DISASSEMBLY;
+                    DisassemblyData.Instructions[DisassemblyData.Count] = ud_obj;
+                    DisassemblyData.InstructionLengths[DisassemblyData.Count] = instrlen;
+                    DisassemblyData.Count++;
+                    HookEngine_Memcpy(&DisassemblyData.InstuctionBuffer[DisassemblyData.Length], ((BYTE*)pTargetFunctionAddress) + DisassemblyData.Length, instrlen);
+                    DisassemblyData.Length += instrlen;
                 }
-                break;
-                case UD_Iint3:
-                {
-                    //don't bother patching an int3
-                    return INVALID_DISASSEMBLY;
-                }
-                break;
-                case UD_Iret:
-                {
-                    //function ends early
-                    return INVALID_DISASSEMBLY;
-                }
-                break;
-                default:
-                break;
-                }
-
             }
 
-            
-            
-            result += instrlen;
-        } while (result < cbRequired && instrlen != 0);
+        } while (DisassemblyData.Length < cbRequired &&
+                 DisassemblyData.Count < MAX_INSTRUCTIONS &&
+                 instrlen != 0);
 
-        if (result >= cbRequired)
+        return DisassemblyData.Length;
+    }
+
+    /**
+        HookEngine_IsJump(ud_mnemonic_code)
+    */
+    BOOL HookEngine_IsJump(ud_mnemonic_code code)
+    {
+        switch (code)
         {
-            return result;
+            case UD_Ija:
+            case UD_Ijae:
+            case UD_Ijb:
+            case UD_Ijbe:
+            case UD_Ijcxz:
+            case UD_Ijecxz:
+            case UD_Ijg:
+            case UD_Ijge:
+            case UD_Ijl:
+            case UD_Ijle:
+            case UD_Ijmp:
+            case UD_Ijno:
+            case UD_Ijnp:
+            case UD_Ijns:
+            case UD_Ijnz:
+            case UD_Ijo:
+            case UD_Ijp:
+            case UD_Ijrcxz:
+            case UD_Ijs:
+            case UD_Ijz:
+                return TRUE;
         }
 
-        return INVALID_DISASSEMBLY;
+        return FALSE;
+    }
+
+    /**
+    HookEngine_IsRet(ud_mnemonic_code)
+    */
+    BOOL HookEngine_IsRet(ud_mnemonic_code code)
+    {
+        switch (code)
+        {
+        case UD_Iret:
+        case UD_Iretf:
+            return TRUE;
+        }
+
+        return FALSE;
     }
 
     /**
@@ -248,14 +282,14 @@ namespace nettitude
     {
         CONST UINT_PTR  twoGB = 0x7FFFFFFF;
         CONST SIZE_T   Page = 4096;
-        UINT_PTR currentAddress = pTargetFunction + twoGB - Page;
+        UINT_PTR currentAddress = pTargetFunction;
+        UINT_PTR maxAddress = pTargetFunction + twoGB - Page;
+        UINT_PTR minAddress = pTargetFunction - twoGB + Page;
         MEMORY_BASIC_INFORMATION memInfo = { 0 };
         HOOKCONTEXT_INTERNAL* pResult = NULL;
 
-        //
-        // Search infront of the terget function
-        //
-        do
+
+        while (currentAddress<maxAddress)
         {
             if (g_pVirtualQuery((LPVOID)currentAddress, &memInfo, contextSize))
             {
@@ -269,20 +303,23 @@ namespace nettitude
                         //early out
                         return pResult;
                     }
-
                 }
+
+                currentAddress += memInfo.RegionSize;
+            }
+            else
+            {
+                currentAddress += Page;
             }
 
-            currentAddress -= Page;
+        }
 
-        } while (pTargetFunction < currentAddress);
-
-        currentAddress = pTargetFunction - twoGB + Page;
+        currentAddress = pTargetFunction;
 
         //
         // Search behind of the terget function
         //
-        do
+        while (currentAddress>minAddress)
         {
             if (g_pVirtualQuery((LPVOID)currentAddress, &memInfo, contextSize))
             {
@@ -297,11 +334,16 @@ namespace nettitude
                         return pResult;
                     }
                 }
+
+                currentAddress -= memInfo.RegionSize;
+
+            }
+            else
+            {
+                currentAddress -= Page;
             }
 
-            currentAddress += Page;
-
-        } while (pTargetFunction > currentAddress);
+        }
 
 
         return pResult;
@@ -319,30 +361,15 @@ namespace nettitude
         return pResult;
     }
 
-    /**
-        HookEngine_Memcpy
-
-        memcpy without calling memcpy
-    */
-    __forceinline void HookEngine_Memcpy(LPVOID dst, LPCVOID src, SIZE_T length)
-    {
-        if (dst && src && length)
-        {
-            __movsb((unsigned char*)dst, (const unsigned char*)src, length);
-        }
-    }
 
     /**
-        HookEngine_Memset
+    HookEngine_AllocateContext
 
-        memset without calling memset
+    Allocates a context that can be anywhere in user space
     */
-    __forceinline void HookEngine_Memset(LPVOID dst, BYTE set, SIZE_T length)
+    static VOID HookEngine_FreeContext(HOOKCONTEXT_INTERNAL* pContext)
     {
-        if (dst && length)
-        {
-            __stosb((unsigned char*)dst, set, length);
-        }
+        HOOKCONTEXT_INTERNAL*   pResult = (HOOKCONTEXT_INTERNAL*)g_pVirtualFree(pContext, pContext->cbSize, MEM_RELEASE);
     }
 
     /**
@@ -359,7 +386,7 @@ namespace nettitude
             return (INT32)ret - (INT32)sizeof(JMP_INSTR_86);
         }
 
-        return -((INT32)ret - (INT32)sizeof(JMP_INSTR_86));
+        return -((INT32)ret + (INT32)sizeof(JMP_INSTR_86));
     }
 
     BOOL IsInitialised()
@@ -553,16 +580,26 @@ OUT             PHOOKCONTEXT*  ppHookCtx
 
         if (HookEngine_SetupTargetMemProtection(pTargetFunctionAddress, oldTargetMemProtection))
         {
-            //disassemble some of the function to locate some space for a jump location
-            DWORD cbCopyFromTarget = HookEngine_GetFuncionByteCount((DWORD)sizeof(jmp), pTargetFunctionAddress);
+            DISASSEMBLY_DATA DisasmData = { 0 };
 
-            if (INVALID_DISASSEMBLY != cbCopyFromTarget)
+            //disassemble some of the function to locate some space for a jump location
+            CONST DWORD cbRequired = (DWORD)sizeof(jmp);
+            DWORD cbLength = HookEngine_Disassemble((DWORD)sizeof(jmp), pTargetFunctionAddress, DisasmData);
+            
+
+            if (cbLength >= cbRequired)
             {
+                //if it's a ret, abort
+                if (HookEngine_IsRet(DisasmData.Instructions[0].mnemonic))
+                {
+                    result = HOOK_ERROR_DISASSEMBLE;
+                }
+
                 //this number of bytes will be copied into the trampoline...
-                contextSize = sizeof(HOOKCONTEXT_INTERNAL) +
-                    (cbCopyFromTarget * 2) +
+                DWORD contextSize = sizeof(HOOKCONTEXT_INTERNAL)+
+                    (DisasmData.Length * 2) +
                     (STUB_PADDING_BYTES * 2) +
-                    sizeof(jmptramp) +
+                    sizeof(jmptramp)+
                     sizeof(jmpredir);
 
                 //if a user callback function was specified, we need to make the redirector address
@@ -585,8 +622,8 @@ OUT             PHOOKCONTEXT*  ppHookCtx
                         HookEngine_Memset(pCtx, INT3_INSTRUCTION, contextSize);
 
                         //setup the context + trampoline
-                        pCtx->cbSavedInstructions = cbCopyFromTarget;
-                        pCtx->cbTrampoline = cbCopyFromTarget + sizeof(jmptramp);
+                        pCtx->cbSavedInstructions = DisasmData.Length;
+                        pCtx->cbTrampoline = DisasmData.Length + sizeof(jmptramp);
                         pCtx->cbRedirect = sizeof(jmpredir);
                         pCtx->cbSize = (DWORD)contextSize;
 
@@ -594,142 +631,273 @@ OUT             PHOOKCONTEXT*  ppHookCtx
                         if (pUserFunctionAddress)
                         {
                             pCtx->pbSavedInstructions = (PBYTE)(pCtx + 1);
-                            pCtx->pbRedirect = (PBYTE)(pCtx + 1) + pCtx->cbSavedInstructions + STUB_PADDING_BYTES;
+                            pCtx->pbRedirect = (PBYTE)(pCtx + 1) + DisasmData.Length + STUB_PADDING_BYTES;
 
                             //keep a full copy original bytes
-                            HookEngine_Memcpy(pCtx->pbSavedInstructions, pTargetFunctionAddress, pCtx->cbSavedInstructions);
+                            HookEngine_Memcpy(pCtx->pbSavedInstructions, DisasmData.InstuctionBuffer, DisasmData.Length);
                         }
                         else
                         {
                             pCtx->pbSavedInstructions = NULL;
                             pCtx->pbRedirect = NULL;
                         }
-                        
+
                         pCtx->pbTrampoline = (PBYTE)(pCtx + 1) +
-                                             pCtx->cbSavedInstructions + 
-                                             pCtx->cbRedirect + 
-                                             (STUB_PADDING_BYTES * 2);
+                            pCtx->cbSavedInstructions +
+                            pCtx->cbRedirect +
+                            (STUB_PADDING_BYTES * 2);
 
                         pCtx->Context.pTargetFunctionAddress = pTargetFunctionAddress;
                         pCtx->Context.pUserFunctionAddress = pUserFunctionAddress;
                         pCtx->Context.pTrampoline = pCtx->pbTrampoline;
 
-                        //Copy instructions into the trampoline
-                        HookEngine_Memcpy(pCtx->pbTrampoline, pTargetFunctionAddress, cbCopyFromTarget);
 
-                        //setup the jump data
 
-                        /**************************************************************************
-                        *
-                        * X86 
-                        *
-                        ***************************************************************************/
-#if defined(_M_IX86)
-                        //
-                        // Setup redirect and target function jump, only if a user function was specified
-                        //
-                        if (pUserFunctionAddress)
+                        if (HookEngine_IsJump(DisasmData.Instructions[0].mnemonic) &&
+                            DisasmData.InstructionLengths[0] >= cbRequired)
                         {
-                            //setup the redirector which jumps to the user function
-                            HookEngine_Memcpy(&jmpredir, X86_TRAMPOLINE_INSTRUCTIONS, sizeof(X86_TRAMPOLINE_INSTRUCTIONS));
-                            jmpredir.target = (UINT32)pUserFunctionAddress;
-       
-                            //setup the jmp instruction that jumps to the redirector
-                            jmp.target = HookEngine_RelativeJumpOffset32((UINT_PTR)pTargetFunctionAddress, (UINT_PTR)pCtx->pbRedirect);
-                        }
-
-                        UINT_PTR pTarget = (UINT_PTR)pTargetFunctionAddress + (UINT_PTR)sizeof(jmp);
-
-                        //setup the trampoline
-                        HookEngine_Memcpy(&jmptramp, X86_TRAMPOLINE_INSTRUCTIONS, sizeof(X86_TRAMPOLINE_INSTRUCTIONS));
-                        jmptramp.target = ((UINT32)pTarget);
-       
-#elif defined(_M_X64)
-                        /**************************************************************************
-                        *
-                        * X64 
-                        *
-                        ***************************************************************************/
-
-                        // Setup redirect and target function jump, only if a user function was specified
-                        //
-                        if (pUserFunctionAddress)
-                        {
-                            //setup the redirector which jumps to the user function
-                            HookEngine_Memcpy(&jmpredir, X64_TRAMPOLINE_INSTRUCTIONS, sizeof(X64_TRAMPOLINE_INSTRUCTIONS));
-                            jmpredir.hiaddr = (UINT32)((UINT_PTR)pUserFunctionAddress >> 32);
-                            jmpredir.loaddr = (UINT32)((UINT_PTR)pUserFunctionAddress);
-
-                            //setup the jmp instruction that jumps to the redirector
-                            jmp.target = HookEngine_RelativeJumpOffset32((UINT_PTR)pTargetFunctionAddress, (UINT_PTR)pCtx->pbRedirect);
-                        }
-
-                        //setup the trampoline
-                        UINT_PTR pTarget = (UINT_PTR)pTargetFunctionAddress + (UINT_PTR)sizeof(jmp);
-                        HookEngine_Memcpy(&jmptramp, X64_TRAMPOLINE_INSTRUCTIONS, sizeof(X64_TRAMPOLINE_INSTRUCTIONS));
-                        jmptramp.hiaddr = (UINT32)((UINT_PTR)pTarget >> 32);
-                        jmptramp.loaddr = (UINT32)((UINT_PTR)pTarget);
-#else
-                        /**************************************************************************
-                        *
-                        * Platform unsupported 
-                        *
-                        ***************************************************************************/
-
-                        #error Unsupported platform
-#endif
-
-                        //Copy the trampoline instructions into the trampoline area
-                        HookEngine_Memcpy(&pCtx->pbTrampoline[cbCopyFromTarget], &jmptramp, sizeof(jmptramp));
-
-                        //
-                        // If a user function was specified then install the jmp in the target
-                        //
-                        if (pUserFunctionAddress)
-                        {
-                            //copy redirect
-                            HookEngine_Memcpy(pCtx->pbRedirect, &jmpredir, sizeof(jmpredir));
-
-                            //copy jump into the target function
-                            HookEngine_Memcpy(pTargetFunctionAddress, &jmp, sizeof(jmp));
-
-                            //any remaining instructions of the target should be nop's
-                            DWORD remain = cbCopyFromTarget - sizeof(jmp);
-
-                            if (remain)
+                            //get the relative offset of the jmp and create a trampoline that jumps to
+                            //that address
+                            const ud_operand& operand = DisasmData.Instructions[0].operand[0];
+                            UINT_PTR address = 0;
+                                                        
+                            if (operand.type == UD_OP_JIMM)
                             {
-                                HookEngine_Memset((((PBYTE)pTargetFunctionAddress) + sizeof(jmp)), NOP_INSTRUCTION, remain);
+                                switch (operand.size)
+                                {
+                                case  8:
+                                    address = (UINT_PTR)pTargetFunctionAddress + (UINT_PTR)(DisasmData.Instructions[0].pc + operand.lval.sbyte) - DisasmData.InstructionLengths[0];
+                                case 16:
+                                    address = (UINT_PTR)pTargetFunctionAddress + (UINT_PTR)(DisasmData.Instructions[0].pc + operand.lval.sword) - DisasmData.InstructionLengths[0];
+                                case 32:
+                                    address = (UINT_PTR)pTargetFunctionAddress + (UINT_PTR)(DisasmData.Instructions[0].pc + operand.lval.sdword) - DisasmData.InstructionLengths[0];
+                                }
+                            }
+                            else if (operand.type == UD_OP_MEM)
+                            {
+                                if (operand.base == UD_R_RIP && 
+                                    operand.index == UD_NONE &&
+                                    operand.scale == 0)
+                                {
+                                    UINT_PTR* pAddr = (UINT_PTR*)((BYTE*)DisasmData.Instructions[0].pc + operand.lval.sdword);
+                                    address = *pAddr;
+                                }
+                                else if (operand.base == UD_NONE && 
+                                         operand.index == UD_NONE &&
+                                         operand.scale == 0)
+                                {
+                                    UINT_PTR* pAddr = (UINT_PTR*)(operand.lval.uqword);
+                                    address = *pAddr;
+                                }
+                            }
+
+                            if (address != 0)
+                            {
+                                //make a trampoline that jumps to the address
+                                /**************************************************************************
+                                *
+                                * X86
+                                *
+                                ***************************************************************************/
+#if defined(_M_IX86)
+                                //
+                                // Setup redirect and target function jump, only if a user function was specified
+                                //
+                                if (pUserFunctionAddress)
+                                {
+                                    //setup the redirector which jumps to the user function
+                                    HookEngine_Memcpy(&jmpredir, X86_TRAMPOLINE_INSTRUCTIONS, sizeof(X86_TRAMPOLINE_INSTRUCTIONS));
+                                    jmpredir.target = (UINT32)pUserFunctionAddress;
+
+                                    //setup the jmp instruction that jumps to the redirector
+                                    jmp.target = HookEngine_RelativeJumpOffset32((UINT_PTR)pTargetFunctionAddress, (UINT_PTR)pCtx->pbRedirect);
+                                }
+
+                                UINT_PTR pTarget = (UINT_PTR)pTargetFunctionAddress + (UINT_PTR)sizeof(jmp);
+
+                                //setup the trampoline
+                                HookEngine_Memcpy(&jmptramp, X86_TRAMPOLINE_INSTRUCTIONS, sizeof(X86_TRAMPOLINE_INSTRUCTIONS));
+                                jmptramp.target = ((UINT32)address);
+
+#elif defined(_M_X64)
+                                /**************************************************************************
+                                *
+                                * X64
+                                *
+                                ***************************************************************************/
+
+                                // Setup redirect and target function jump, only if a user function was specified
+                                //
+                                if (pUserFunctionAddress)
+                                {
+                                    //setup the redirector which jumps to the user function
+                                    HookEngine_Memcpy(&jmpredir, X64_TRAMPOLINE_INSTRUCTIONS, sizeof(X64_TRAMPOLINE_INSTRUCTIONS));
+                                    jmpredir.hiaddr = (UINT32)((UINT_PTR)pUserFunctionAddress >> 32);
+                                    jmpredir.loaddr = (UINT32)((UINT_PTR)pUserFunctionAddress);
+
+                                    //setup the jmp instruction that jumps to the redirector
+                                    jmp.target = HookEngine_RelativeJumpOffset32((UINT_PTR)pTargetFunctionAddress, (UINT_PTR)pCtx->pbRedirect);
+                                }
+
+                                //setup the trampoline
+                                UINT_PTR pTarget = (UINT_PTR)pTargetFunctionAddress + (UINT_PTR)sizeof(jmp);
+                                HookEngine_Memcpy(&jmptramp, X64_TRAMPOLINE_INSTRUCTIONS, sizeof(X64_TRAMPOLINE_INSTRUCTIONS));
+                                jmptramp.hiaddr = (UINT32)((UINT_PTR)address >> 32);
+                                jmptramp.loaddr = (UINT32)((UINT_PTR)address);
+#else
+                                /**************************************************************************
+                                *
+                                * Platform unsupported
+                                *
+                                ***************************************************************************/
+
+#error Unsupported platform
+#endif   
+                                //Copy the trampoline instructions into the trampoline area
+                                HookEngine_Memcpy(&pCtx->pbTrampoline[0], &jmptramp, sizeof(jmptramp));
+
+                                //
+                                // If a user function was specified then install the jmp in the target
+                                //
+                                if (pUserFunctionAddress)
+                                {
+                                    //copy redirect
+                                    HookEngine_Memcpy(pCtx->pbRedirect, &jmpredir, sizeof(jmpredir));
+
+                                    //copy jump into the target function
+                                    HookEngine_Memcpy(pTargetFunctionAddress, &jmp, sizeof(jmp));
+
+                                    //any remaining instructions of the target should be nop's
+                                    DWORD remain = DisasmData.Length - sizeof(jmp);
+
+                                    if (remain)
+                                    {
+                                        HookEngine_Memset((((PBYTE)pTargetFunctionAddress) + sizeof(jmp)), NOP_INSTRUCTION, remain);
+                                    }
+                                }
+
+                                *ppHookCtx = &pCtx->Context;
+
+                                ++g_HookCount;
+
+                                result = HOOK_SUCCESS;
+                            }
+                            else
+                            {
+                                HookEngine_FreeContext(pCtx);
+                                result = HOOK_ERROR_DISASSEMBLE;
                             }
                         }
-
-                        *ppHookCtx = &pCtx->Context;
-
-                        ++g_HookCount;
-
-                        result = HOOK_SUCCESS;
-
-                    }
-                    catch (...)
-                    {
-                        //
-                        // It's conceivable that we've trashed the target function
-                        // at this point, so we should perhaps do some better handling
-                        // and copy the snatched function bytes back over the top of
-                        // any jmp instruction we added.  That's currently a TODO
-                        //
-                        if (pCtx)
+                        else
                         {
-                            g_pVirtualFree(pCtx, pCtx->cbSize, MEM_RELEASE);
+                            //Copy instructions into the trampoline
+                            HookEngine_Memcpy(pCtx->pbTrampoline, DisasmData.InstuctionBuffer, DisasmData.Length);
+
+                            //setup the jump data
+
+                            /**************************************************************************
+                            *
+                            * X86
+                            *
+                            ***************************************************************************/
+#if defined(_M_IX86)
+                            //
+                            // Setup redirect and target function jump, only if a user function was specified
+                            //
+                            if (pUserFunctionAddress)
+                            {
+                                //setup the redirector which jumps to the user function
+                                HookEngine_Memcpy(&jmpredir, X86_TRAMPOLINE_INSTRUCTIONS, sizeof(X86_TRAMPOLINE_INSTRUCTIONS));
+                                jmpredir.target = (UINT32)pUserFunctionAddress;
+
+                                //setup the jmp instruction that jumps to the redirector
+                                jmp.target = HookEngine_RelativeJumpOffset32((UINT_PTR)pTargetFunctionAddress, (UINT_PTR)pCtx->pbRedirect);
+                            }
+
+                            UINT_PTR pTarget = (UINT_PTR)pTargetFunctionAddress + (UINT_PTR)sizeof(jmp);
+
+                            //setup the trampoline
+                            HookEngine_Memcpy(&jmptramp, X86_TRAMPOLINE_INSTRUCTIONS, sizeof(X86_TRAMPOLINE_INSTRUCTIONS));
+                            jmptramp.target = ((UINT32)pTarget);
+
+#elif defined(_M_X64)
+                            /**************************************************************************
+                            *
+                            * X64
+                            *
+                            ***************************************************************************/
+
+                            // Setup redirect and target function jump, only if a user function was specified
+                            //
+                            if (pUserFunctionAddress)
+                            {
+                                //setup the redirector which jumps to the user function
+                                HookEngine_Memcpy(&jmpredir, X64_TRAMPOLINE_INSTRUCTIONS, sizeof(X64_TRAMPOLINE_INSTRUCTIONS));
+                                jmpredir.hiaddr = (UINT32)((UINT_PTR)pUserFunctionAddress >> 32);
+                                jmpredir.loaddr = (UINT32)((UINT_PTR)pUserFunctionAddress);
+
+                                //setup the jmp instruction that jumps to the redirector
+                                jmp.target = HookEngine_RelativeJumpOffset32((UINT_PTR)pTargetFunctionAddress, (UINT_PTR)pCtx->pbRedirect);
+                            }
+
+                            //setup the trampoline
+                            UINT_PTR pTarget = (UINT_PTR)pTargetFunctionAddress + (UINT_PTR)sizeof(jmp);
+                            HookEngine_Memcpy(&jmptramp, X64_TRAMPOLINE_INSTRUCTIONS, sizeof(X64_TRAMPOLINE_INSTRUCTIONS));
+                            jmptramp.hiaddr = (UINT32)((UINT_PTR)pTarget >> 32);
+                            jmptramp.loaddr = (UINT32)((UINT_PTR)pTarget);
+#else
+                            /**************************************************************************
+                            *
+                            * Platform unsupported
+                            *
+                            ***************************************************************************/
+
+#error Unsupported platform
+#endif
+
+                            //Copy the trampoline instructions into the trampoline area
+                            HookEngine_Memcpy(&pCtx->pbTrampoline[DisasmData.Length], &jmptramp, sizeof(jmptramp));
+
+                            //
+                            // If a user function was specified then install the jmp in the target
+                            //
+                            if (pUserFunctionAddress)
+                            {
+                                //copy redirect
+                                HookEngine_Memcpy(pCtx->pbRedirect, &jmpredir, sizeof(jmpredir));
+
+                                //copy jump into the target function
+                                HookEngine_Memcpy(pTargetFunctionAddress, &jmp, sizeof(jmp));
+
+                                //any remaining instructions of the target should be nop's
+                                DWORD remain = DisasmData.Length - sizeof(jmp);
+
+                                if (remain)
+                                {
+                                    HookEngine_Memset((((PBYTE)pTargetFunctionAddress) + sizeof(jmp)), NOP_INSTRUCTION, remain);
+                                }
+                            }
+
+                            *ppHookCtx = &pCtx->Context;
+
+                            ++g_HookCount;
+
+                            result = HOOK_SUCCESS;
+
                         }
 
+                    }//try
+                    catch (...)
+                    {
                         result = HOOK_ERROR_EXCEPTION_RAISED;
                     }
 
-                }
+                }//if
                 else
                 {
                     result = HOOK_ERROR_OUT_OF_MEMORY;
                 }
+               
             }
             else
             {
@@ -789,7 +957,7 @@ extern "C" HOOKRESULT HookEngine_RemoveHook
                 }
                 
                 HookEngine_RestoreTargetMemProtection(pInternal->Context.pTargetFunctionAddress, oldTargetMemProtection);
-                g_pVirtualFree(pInternal, pInternal->cbSize, MEM_RELEASE);
+                HookEngine_FreeContext( pInternal );
                 --g_HookCount;
                 result = HOOK_SUCCESS;
             }
